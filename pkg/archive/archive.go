@@ -45,6 +45,7 @@ type (
 
 	// TarOptions wraps the tar options.
 	TarOptions struct {
+		DereferenceLinks bool
 		IncludeFiles     []string
 		ExcludePatterns  []string
 		Compression      Compression
@@ -796,103 +797,172 @@ func TarWithOptions(srcPath string, options *TarOptions) (io.ReadCloser, error) 
 
 		for _, include := range options.IncludeFiles {
 			rebaseName := options.RebaseNames[include]
-
-			walkRoot := getWalkRoot(srcPath, include)
-			filepath.Walk(walkRoot, func(filePath string, f os.FileInfo, err error) error {
-				if err != nil {
-					logrus.Errorf("Tar: Can't stat file %s to tar: %s", srcPath, err)
-					return nil
-				}
-
-				relFilePath, err := filepath.Rel(srcPath, filePath)
-				if err != nil || (!options.IncludeSourceDir && relFilePath == "." && f.IsDir()) {
-					// Error getting relative path OR we are looking
-					// at the source directory path. Skip in both situations.
-					return nil
-				}
-
-				if options.IncludeSourceDir && include == "." && relFilePath != "." {
-					relFilePath = strings.Join([]string{".", relFilePath}, string(filepath.Separator))
-				}
-
-				skip := false
-
-				// If "include" is an exact match for the current file
-				// then even if there's an "excludePatterns" pattern that
-				// matches it, don't skip it. IOW, assume an explicit 'include'
-				// is asking for that file no matter what - which is true
-				// for some files, like .dockerignore and Dockerfile (sometimes)
-				if include != relFilePath {
-					skip, err = pm.Matches(relFilePath)
-					if err != nil {
-						logrus.Errorf("Error matching %s: %v", relFilePath, err)
-						return err
-					}
-				}
-
-				if skip {
-					// If we want to skip this file and its a directory
-					// then we should first check to see if there's an
-					// excludes pattern (e.g. !dir/file) that starts with this
-					// dir. If so then we can't skip this dir.
-
-					// Its not a dir then so we can just return/skip.
-					if !f.IsDir() {
-						return nil
-					}
-
-					// No exceptions (!...) in patterns so just skip dir
-					if !pm.Exclusions() {
-						return filepath.SkipDir
-					}
-
-					dirSlash := relFilePath + string(filepath.Separator)
-
-					for _, pat := range pm.Patterns() {
-						if !pat.Exclusion() {
-							continue
-						}
-						if strings.HasPrefix(pat.String()+string(filepath.Separator), dirSlash) {
-							// found a match - so can't skip this dir
-							return nil
-						}
-					}
-
-					// No matching exclusion dir so just skip dir
-					return filepath.SkipDir
-				}
-
-				if seen[relFilePath] {
-					return nil
-				}
-				seen[relFilePath] = true
-
-				// Rename the base resource.
-				if rebaseName != "" {
-					var replacement string
-					if rebaseName != string(filepath.Separator) {
-						// Special case the root directory to replace with an
-						// empty string instead so that we don't end up with
-						// double slashes in the paths.
-						replacement = rebaseName
-					}
-
-					relFilePath = strings.Replace(relFilePath, include, replacement, 1)
-				}
-
-				if err := ta.addTarFile(filePath, relFilePath); err != nil {
-					logrus.Errorf("Can't add file %s to tar: %s", filePath, err)
-					// if pipe is broken, stop writing tar stream to it
-					if err == io.ErrClosedPipe {
-						return err
-					}
-				}
-				return nil
-			})
-		}
+			walkRoot := getWalkRoot(srcPath, include);
+			err := walkPath(walkRoot, srcPath, options, include, seen, pm, rebaseName, ta, "");
+            if err != nil {
+                logrus.Errorf("Error: There was an issue while walking path %s %s", walkRoot, err)
+            }
+        }
 	}()
 
 	return pipeReader, nil
+}
+
+func walkPath(walkRoot string, srcPath string, options *TarOptions, include string, seen map[string]bool, pm *fileutils.PatternMatcher, rebaseName string, ta *tarAppender, symLinkDir string) error {
+
+    filepath.Walk(walkRoot, func(filePath string, f os.FileInfo, err error) error {
+
+        if err != nil {
+            logrus.Errorf("Tar: Can't stat file %s to tar: %s", srcPath, err)
+            return nil
+        }
+
+        relFilePath, err := filepath.Rel(srcPath, filePath)
+        if err != nil || (!options.IncludeSourceDir && relFilePath == "." && f.IsDir()) {
+            // Error getting relative path OR we are looking
+            // at the source directory path. Skip in both situations.
+            return nil
+        }
+
+        if options.IncludeSourceDir && include == "." && relFilePath != "." {
+            relFilePath = strings.Join([]string{".", relFilePath}, string(filepath.Separator))
+        }
+
+        skip := false
+
+        // If "include" is an exact match for the current file
+        // then even if there's an "excludePatterns" pattern that
+        // matches it, don't skip it. IOW, assume an explicit 'include'
+        // is asking for that file no matter what - which is true
+        // for some files, like .dockerignore and Dockerfile (sometimes)
+        if include != relFilePath {
+            skip, err = pm.Matches(relFilePath)
+            if err != nil {
+                logrus.Errorf("Error matching %s: %v", relFilePath, err)
+                return err
+            }
+        }
+
+        if skip {
+            // If we want to skip this file and its a directory
+            // then we should first check to see if there's an
+            // excludes pattern (e.g. !dir/file) that starts with this
+            // dir. If so then we can't skip this dir.
+
+            // Its not a dir then so we can just return/skip.
+            if !f.IsDir() {
+                return nil
+            }
+
+            // No exceptions (!...) in patterns so just skip dir
+            if !pm.Exclusions() {
+                return filepath.SkipDir
+            }
+
+            dirSlash := relFilePath + string(filepath.Separator)
+
+            for _, pat := range pm.Patterns() {
+                if !pat.Exclusion() {
+                    continue
+                }
+                if strings.HasPrefix(pat.String()+string(filepath.Separator), dirSlash) {
+                    // found a match - so can't skip this dir
+                    return nil
+                }
+            }
+
+            // No matching exclusion dir so just skip dir
+            return filepath.SkipDir
+        }
+
+        if seen[relFilePath] {
+            return nil
+        }
+
+        // If the walkRoot is a deferenced symbolic link, then the relFilePath need to be set to the symbolic link path.
+        if symLinkDir != "" && options.DereferenceLinks {
+            symLinkDir = strings.Replace(symLinkDir, srcPath, "", 1);
+            fullPath := filepath.Join(srcPath, relFilePath);
+            // Need to determine if the current path is a folder or a file
+            fi, err := os.Lstat(fullPath);
+            if err != nil {
+                logrus.Errorf("Error: Could not lstat fullPath:%s  %v", fullPath, err)
+                return err;
+            }
+            if fi.IsDir() {
+                relFilePath = symLinkDir;
+            } else {
+                relFilePath = filepath.Join(symLinkDir,strings.Split(fullPath, walkRoot)[1]);
+            }
+        }
+        seen[relFilePath] = true
+
+        // Rename the base resource.
+        if rebaseName != "" {
+            var replacement string
+            if rebaseName != string(filepath.Separator) {
+                // Special case the root directory to replace with an
+                // empty string instead so that we don't end up with
+                // double slashes in the paths.
+                replacement = rebaseName
+            }
+            relFilePath = strings.Replace(relFilePath, include, replacement, 1)
+        }
+
+        realPath := filePath;
+        // Only walk symbolic links when dereferencing.
+        walkSymLinkDir := false;
+
+        if options.DereferenceLinks {
+            // Need to determine if the current path is a symbolic link.
+            fi, err := os.Lstat(realPath)
+            if err != nil {
+                logrus.Errorf("Error: Could not stats on file:%s  %v", realPath, err)
+                return err
+            }
+
+            // If the file is a symbolic link, then dereference the link
+            if fi.Mode() & os.ModeSymlink == os.ModeSymlink {
+                realPath, err = os.Readlink(filePath);
+                if err != nil {
+                    logrus.Errorf("Error: Could not dereference symlink for:%s  %v", realPath, err)
+                    return err;
+                }
+                if !strings.HasPrefix(realPath, "/"){
+                    parent, _ := filepath.Split(filePath);
+                    realPath = filepath.Join(parent, realPath);
+                }
+                fi, err = os.Lstat(realPath)
+                if err != nil {
+                    logrus.Errorf("Error: Could not get stats on file:%s  %v", realPath, err)
+                    return err
+                }
+                // If the dereferenced link is a folder, then this folder needs to be walked.
+                if fi.IsDir() {
+                    walkSymLinkDir = true;
+                }
+            }
+        }
+
+        if err := ta.addTarFile(realPath, relFilePath); err != nil {
+            logrus.Errorf("Can't add file %s to tar: %s", realPath, err)
+            // if pipe is broken, stop writing tar stream to it
+            if err == io.ErrClosedPipe {
+                return err
+            }
+        }
+
+        // filepath.Walk does not follow symbolic links. So do that here.
+        if walkSymLinkDir {
+            err := walkPath(realPath, srcPath, options, include, seen, pm, rebaseName, ta, relFilePath);
+            if err != nil {
+                logrus.Errorf("Error: Trouble walking resolved symlink directory: %s %v", realPath, err)
+                return err;
+            }
+        }
+        return nil
+    })
+    return nil;
 }
 
 // Unpack unpacks the decompressedArchive to dest with options.
