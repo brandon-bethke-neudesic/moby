@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -733,7 +734,6 @@ func TarWithOptions(srcPath string, options *TarOptions) (io.ReadCloser, error) 
 	if err != nil {
 		return nil, err
 	}
-
 	pipeReader, pipeWriter := io.Pipe()
 
 	compressWriter, err := CompressStream(pipeWriter, options.Compression)
@@ -794,11 +794,12 @@ func TarWithOptions(srcPath string, options *TarOptions) (io.ReadCloser, error) 
 		}
 
 		seen := make(map[string]bool)
+		symLinkDirectoriesSeen := make(map[string]bool);
 
 		for _, include := range options.IncludeFiles {
 			rebaseName := options.RebaseNames[include]
 			walkRoot := getWalkRoot(srcPath, include);
-			err := walkPath(walkRoot, srcPath, options, include, seen, pm, rebaseName, ta, "");
+			err := walkPath(walkRoot, srcPath, options, include, seen, pm, rebaseName, ta, "", symLinkDirectoriesSeen);
             if err != nil {
                 logrus.Errorf("Error: There was an issue while walking path %s %s", walkRoot, err)
             }
@@ -808,7 +809,7 @@ func TarWithOptions(srcPath string, options *TarOptions) (io.ReadCloser, error) 
 	return pipeReader, nil
 }
 
-func walkPath(walkRoot string, srcPath string, options *TarOptions, include string, seen map[string]bool, pm *fileutils.PatternMatcher, rebaseName string, ta *tarAppender, symLinkDir string) error {
+func walkPath(walkRoot string, srcPath string, options *TarOptions, include string, seen map[string]bool, pm *fileutils.PatternMatcher, rebaseName string, ta *tarAppender, symLinkDir string, symLinkDirectoriesSeen map[string]bool) error {
 
     filepath.Walk(walkRoot, func(filePath string, f os.FileInfo, err error) error {
 
@@ -928,7 +929,7 @@ func walkPath(walkRoot string, srcPath string, options *TarOptions, include stri
                     logrus.Errorf("Error: Could not dereference symlink for:%s  %v", realPath, err)
                     return err;
                 }
-                if !strings.HasPrefix(realPath, "/"){
+                if !path.IsAbs(realPath) {
                     parent, _ := filepath.Split(filePath);
                     realPath = filepath.Join(parent, realPath);
                 }
@@ -938,7 +939,8 @@ func walkPath(walkRoot string, srcPath string, options *TarOptions, include stri
                     return err
                 }
                 // If the dereferenced link is a folder, then this folder needs to be walked.
-                if fi.IsDir() {
+                // But make sure we don't follow a recursive symlink
+                if fi.IsDir() && !symLinkDirectoriesSeen[realPath] {
                     walkSymLinkDir = true;
                 }
             }
@@ -954,7 +956,10 @@ func walkPath(walkRoot string, srcPath string, options *TarOptions, include stri
 
         // filepath.Walk does not follow symbolic links. So do that here.
         if walkSymLinkDir {
-            err := walkPath(realPath, srcPath, options, include, seen, pm, rebaseName, ta, relFilePath);
+        	// Keep a record of the symlink directories walk for this heirarchy. This will prevent walking a symlink infinite loop.
+        	symLinkDirectoriesSeen[realPath] = true;
+            err := walkPath(realPath, srcPath, options, include, seen, pm, rebaseName, ta, relFilePath, symLinkDirectoriesSeen);            
+            symLinkDirectoriesSeen = make(map[string]bool);
             if err != nil {
                 logrus.Errorf("Error: Trouble walking resolved symlink directory: %s %v", realPath, err)
                 return err;
