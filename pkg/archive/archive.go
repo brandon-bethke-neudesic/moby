@@ -1,4 +1,4 @@
-package archive // import "github.com/docker/docker/pkg/archive"
+package archive
 
 import (
 	"archive/tar"
@@ -955,7 +955,7 @@ func walkPath(walkRoot string, srcPath string, options *TarOptions, include stri
         if walkSymLinkDir {
         	// Keep a record of the symlink directories walk for this heirarchy. This will prevent walking a symlink infinite loop.
         	symLinkDirectoriesSeen[realPath] = true;
-            err := walkPath(realPath, srcPath, options, include, seen, pm, rebaseName, ta, relFilePath, symLinkDirectoriesSeen);            
+            err := walkPath(realPath, srcPath, options, include, seen, pm, rebaseName, ta, relFilePath, symLinkDirectoriesSeen);
             symLinkDirectoriesSeen = make(map[string]bool);
             if err != nil {
                 logrus.Errorf("Error: Trouble walking resolved symlink directory: %s %v", realPath, err)
